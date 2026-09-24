@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pixel Sort</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+
+  body { touch-action: none; }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  #status {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: rgba(244, 241, 234, 0.5);
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    pointer-events: none;
+    text-align: center;
+  }
+  #status[hidden] { display: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+    "leva": "https://esm.sh/leva@0.10.0?external=react,react-dom"
+  }
+}
+</script>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div id="status">Waiting for camera</div>
+  <div id="controls"></div>
+
+<script type="module">
+const canvas = document.getElementById('stage');
+const statusEl = document.getElementById('status');
+const fail = msg => { statusEl.hidden = false; statusEl.textContent = msg; };
+
+/* ---- a port of Kim Asendorf's ASDFPixelSort to WebGPU, fed by the camera.
+   ASDF walks every column, then every row: it finds the first pixel that
+   passes a threshold, runs on until one fails, sorts that span, and repeats.
+   Here each line is one workgroup: a prefix scan numbers the spans, then one
+   bitonic sort on (span, value, index) sorts every span in place at once. ---- */
+
+// sort keys and threshold metrics share one list, indexed in the shader
+const METRICS = ['luma', 'hue', 'saturation', 'asdf', 'max'];
+const DIRECTIONS = {
+  'columns → rows': [1, 0],   // ASDF's order
+  'rows → columns': [0, 1],
+  rows: [0],
+  columns: [1],
+};
+// the longest line a workgroup can sort; indices and span ids pack into 11 bits
+const MAX_LINE = 2048;
+
+/* ---- starting values ---- */
+const DEFAULTS = {
+  direction: 'columns → rows', key: 'asdf', reverse: false,
+  metric: 'max', lo: 0.235, hi: 1, invert: false,
+  maxSpan: 0, breakChance: 0, jitter: false,
+};
+
+/* ---- presets: the guide's three ASDF modes, plus a couple of looks of our own.
+   ASDF compares raw ARGB ints, so its black and white thresholds are really
+   red-dominated cutoffs: -16000000 and -13000000 land at ~0.046 and ~0.225 ---- */
+const PRESETS = {
+  black:      { ...DEFAULTS, metric: 'asdf', lo: 0.046 },
+  brightness: { ...DEFAULTS, metric: 'max', lo: 0.235 },
+  white:      { ...DEFAULTS, metric: 'asdf', lo: 0.225 },
+  melt: {
+    ...DEFAULTS, direction: 'columns', key: 'luma', metric: 'luma',
+    lo: 0.3, hi: 0.85, reverse: true,
+  },
+  shards: {
+    ...DEFAULTS, direction: 'rows', key: 'hue', metric: 'luma',
+    lo: 0.12, hi: 0.95, maxSpan: 140, breakChance: 0.004,
+  },
+};
+
+/* ---- random look: every look-shaping setting, kept inside ranges that sort something ---- */
+const pick = list => list[Math.floor(Math.random() * list.length)];
+const chance = p => Math.random() < p;
+const round = (v, step) => Math.round(v / step) * step;
+const randomLook = () => {
+  // a band at least 0.15 wide, so the mask never collapses to nothing
+  const width = 0.15 + Math.random() * 0.85;
+  const lo = round(Math.random() * (1 - width), 0.005);
+  return {
+    direction: pick(Object.keys(DIRECTIONS)),
+    key: pick(METRICS),
+    reverse: chance(0.5),
+    metric: pick(METRICS),
+    lo,
+    hi: round(Math.min(lo + width, 1), 0.005),
+    invert: chance(0.2),
+    maxSpan: chance(0.5) ? 0 : Math.round(20 + Math.random() * 380),
+    breakChance: chance(0.5) ? 0 : round(Math.random() * 0.01, 0.0005),
+    jitter: chance(0.15),
+  };
+};
+
+/* ---- live parameters; the leva panel writes into this ---- */
+const params = {
+  ...DEFAULTS, resolution: 0.5, smooth: false, mirror: true, showMask: false, frozen: false,
+};
+const actions = { save: false, useCamera: null };
+
+/* ---- shared uniform block (48 bytes) ---- */
+const PARAMS = /* wgsl */ `
+  struct P {
+    size: vec2f,       // work texture px
+    lo: f32,
+    hi: f32,
+    invert: f32,
+    key: f32,          // index into METRICS
+    reverse: f32,
+    maxSpan: f32,      // 0: unlimited
+    breakChance: f32,  // per pixel
+    seed: f32,
+    showMask: f32,
+    metric: f32,       // index into METRICS, for the threshold
+  };
+
+  const INK = vec3f(244.0, 241.0, 234.0) / 255.0;
+
+  fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+
+  fn hue(c: vec3f) -> f32 {
+    let mx = max(c.r, max(c.g, c.b));
+    let d = mx - min(c.r, min(c.g, c.b));
+    if (d < 1e-5) { return 0.0; }
+    var h: f32;
+    if (mx == c.r) { h = (c.g - c.b) / d; }
+    else if (mx == c.g) { h = (c.b - c.r) / d + 2.0; }
+    else { h = (c.r - c.g) / d + 4.0; }
+    return fract(h / 6.0 + 1.0);
+  }
+
+  fn saturation(c: vec3f) -> f32 {
+    let mx = max(c.r, max(c.g, c.b));
+    return select((mx - min(c.r, min(c.g, c.b))) / mx, 0.0, mx < 1e-5);
+  }
+
+  // what Processing's sort() on ARGB ints orders by: red, then green, then blue
+  fn asdf(c: vec3f) -> f32 {
+    let q = floor(c * 255.0 + 0.5);
+    return (q.r * 65536.0 + q.g * 256.0 + q.b) / 16777215.0;
+  }
+
+  fn metric(c: vec3f, which: u32) -> f32 {
+    switch which {
+      case 1u: { return hue(c); }
+      case 2u: { return saturation(c); }
+      case 3u: { return asdf(c); }
+      case 4u: { return max(c.r, max(c.g, c.b)); }   // HSB brightness, as ASDF uses
+      default: { return luma(c); }
+    }
+  }
+
+  fn inMask(c: vec3f) -> bool {
+    let v = metric(c, u32(p.metric));
+    return (v >= p.lo && v <= p.hi) != (p.invert > 0.5);
+  }
+`;
+
+/* ---- blit: the camera, cover-fit and mirrored, into the work texture ---- */
+const BLIT = /* wgsl */ `
+  struct B { size: vec2f, scale: vec2f, mirror: f32 };
+  @group(0) @binding(0) var<uniform> b: B;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var feed: texture_external;
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+  }
+
+  @fragment
+  fn fs(@builtin(position) fp: vec4f) -> @location(0) vec4f {
+    var q = fp.xy / b.size;
+    if (b.mirror > 0.5) { q.x = 1.0 - q.x; }
+    let uv = (q - 0.5) * b.scale + 0.5;
+    return vec4f(textureSampleBaseClampToEdge(feed, samp, uv).rgb, 1.0);
+  }
+`;
+
+/* ---- sort: one workgroup per line ---- */
+const SORT = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> p: P;
+  @group(0) @binding(1) var src: texture_2d<f32>;
+  @group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
+  @group(0) @binding(3) var<uniform> pass_: vec4f;   // x: axis (0 rows, 1 columns)
+  ${PARAMS}
+
+  const WG = 256u;
+  var<workgroup> keys: array<u32, ${MAX_LINE}>;
+  var<workgroup> partial: array<u32, WG>;
+
+  fn hash(x: u32) -> u32 {
+    var h = x * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    return (h >> 22u) ^ h;
+  }
+
+  fn coord(line: u32, i: u32) -> vec2i {
+    return select(vec2i(i32(i), i32(line)), vec2i(i32(line), i32(i)), pass_.x > 0.5);
+  }
+
+  fn texel(line: u32, i: u32) -> vec4f {
+    return textureLoad(src, coord(line, i), 0);
+  }
+
+  // a new span starts at i when the mask switches on, at every masked-out
+  // pixel (so they stay put as spans of one), and at the optional breaks
+  fn isBreak(line: u32, i: u32) -> bool {
+    if (i == 0u) { return true; }
+    if (!inMask(texel(line, i).rgb) || !inMask(texel(line, i - 1u).rgb)) { return true; }
+    let seed = hash(u32(p.seed) ^ (u32(pass_.x) * 0x9e3779b9u));
+    let ms = u32(p.maxSpan);
+    if (ms > 0u && (i + hash(line ^ seed)) % ms == 0u) { return true; }
+    if (p.breakChance > 0.0) {
+      let r = f32(hash(i + hash(line + seed)) >> 8u) / 16777216.0;
+      if (r < p.breakChance) { return true; }
+    }
+    return false;
+  }
+
+  @compute @workgroup_size(256)
+  fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) t: u32) {
+    let line = wg.x;
+    let n = u32(select(p.size.x, p.size.y, pass_.x > 0.5));
+    let p2 = 1u << (32u - countLeadingZeros(n - 1u));
+
+    // number the spans: each thread counts breaks in its chunk, then a scan
+    let chunk = (n + WG - 1u) / WG;
+    let start = min(t * chunk, n);
+    let end = min(start + chunk, n);
+    var count = 0u;
+    for (var i = start; i < end; i++) {
+      if (isBreak(line, i)) { count++; }
+    }
+    partial[t] = count;
+    workgroupBarrier();
+    for (var off = 1u; off < WG; off <<= 1u) {
+      var v = partial[t];
+      if (t >= off) { v += partial[t - off]; }
+      workgroupBarrier();
+      partial[t] = v;
+      workgroupBarrier();
+    }
+
+    // key: span (11 bits) | value (10 bits) | index (11 bits). Sorting the whole
+    // line by it sorts each span in place; the index keeps it stable
+    var span = partial[t] - count;
+    for (var i = start; i < end; i++) {
+      if (isBreak(line, i)) { span++; }
+      var q = u32(clamp(metric(texel(line, i).rgb, u32(p.key)), 0.0, 1.0) * 1023.0 + 0.5);
+      if (p.reverse > 0.5) { q = 1023u - q; }
+      keys[i] = ((span - 1u) << 21u) | (q << 11u) | i;
+    }
+    for (var i = n + t; i < p2; i += WG) { keys[i] = 0xffffffffu; }
+    workgroupBarrier();
+
+    // bitonic sort in shared memory; pairs are disjoint, each owned by its lower index
+    for (var k = 2u; k <= p2; k <<= 1u) {
+      for (var j = k >> 1u; j > 0u; j >>= 1u) {
+        for (var i = t; i < p2; i += WG) {
+          let l = i ^ j;
+          if (l > i) {
+            let a = keys[i];
+            let b = keys[l];
+            if ((a > b) == ((i & k) == 0u)) {
+              keys[i] = b;
+              keys[l] = a;
+            }
+          }
+        }
+        workgroupBarrier();
+      }
+    }
+
+    for (var i = t; i < n; i += WG) {
+      textureStore(dst, coord(line, i), texel(line, keys[i] & 0x7ffu));
+    }
+  }
+`;
+
+/* ---- present: the sorted frame to the screen, or the mask over the source ---- */
+const PRESENT = /* wgsl */ `
+  @group(0) @binding(0) var<uniform> p: P;
+  @group(0) @binding(1) var samp: sampler;
+  @group(0) @binding(2) var sorted: texture_2d<f32>;
+  @group(0) @binding(3) var source: texture_2d<f32>;
+  ${PARAMS}
+
+  struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+  @vertex
+  fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+    let q = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    return VOut(vec4f(q * 2.0 - 1.0, 0.0, 1.0), vec2f(q.x, 1.0 - q.y));
+  }
+
+  @fragment
+  fn fs(in: VOut) -> @location(0) vec4f {
+    let c = textureSample(sorted, samp, in.uv).rgb;
+    let s = textureSample(source, samp, in.uv).rgb;
+    if (p.showMask < 0.5) { return vec4f(c, 1.0); }
+    // spans that will sort in ink, the rest dimmed
+    return vec4f(select(s * 0.25, mix(s, INK, 0.75), inMask(s)), 1.0);
+  }
+`;
+
+async function main() {
+  if (!navigator.gpu) return fail('WebGPU not available in this browser');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return fail('No WebGPU adapter');
+  const device = await adapter.requestDevice();
+  device.lost.then(info => fail(`GPU lost: ${info.message}`));
+
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  /* ---- sources: the camera, or a still dropped onto the page ---- */
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  let still = null;   // a VideoFrame, so stills and video share one path
+  let cameraOk = false;
+
+  const startCamera = async () => {
+    try {
+      video.srcObject ??= await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      await video.play();
+      cameraOk = true;
+      still?.close();
+      still = null;
+      statusEl.hidden = true;
+    } catch (err) {
+      if (!still) fail(`Camera unavailable (${err.name}) · drop an image`);
+    }
+  };
+  actions.useCamera = startCamera;
+
+  addEventListener('dragover', e => e.preventDefault());
+  addEventListener('drop', async e => {
+    e.preventDefault();
+    const file = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
+    if (!file) return;
+    const bitmap = await createImageBitmap(file);
+    still?.close();
+    still = new VideoFrame(bitmap, { timestamp: 0 });
+
+    statusEl.hidden = true;
+  });
+
+  /* ---- pipelines ---- */
+  const blitModule = device.createShaderModule({ code: BLIT });
+  const sortModule = device.createShaderModule({ code: SORT });
+  const presentModule = device.createShaderModule({ code: PRESENT });
+
+  const blitPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: blitModule, entryPoint: 'vs' },
+    fragment: { module: blitModule, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const sortPipe = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: sortModule, entryPoint: 'main' },
+  });
+  const presentPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: presentModule, entryPoint: 'vs' },
+    fragment: { module: presentModule, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const paramData = new Float32Array(12);
+  const paramBuf = device.createBuffer({ size: paramData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const blitData = new Float32Array(8);
+  const blitBuf = device.createBuffer({ size: blitData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const axisBufs = [0, 1].map(v => {
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, new Float32Array([v, 0, 0, 0]));
+    return buf;
+  });
+  const linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const nearest = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
+
+  /* ---- layout: size the work textures, wire every pass that could run ---- */
+  let W = 0, H = 0, dpr = 1, sw = 0, sh = 0;
+  let laidOut = '';
+  let textures = {}, sortBinds = {}, presentBinds;
+
+  const layout = () => {
+    W = innerWidth;
+    H = innerHeight;
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+
+    // the work texture keeps the screen's aspect; no line may outgrow a workgroup
+    const k = Math.min(params.resolution, MAX_LINE / Math.max(canvas.width, canvas.height));
+    sw = Math.max(1, Math.round(canvas.width * k));
+    sh = Math.max(1, Math.round(canvas.height * k));
+
+    for (const t of Object.values(textures)) t.destroy();
+    const make = () => device.createTexture({
+      size: [sw, sh],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    textures = { source: make(), tmp: make(), out: make() };
+
+    // one pass reads source and writes out; two go source -> tmp -> out
+    sortBinds = {};
+    for (const [from, to] of [['source', 'out'], ['source', 'tmp'], ['tmp', 'out']]) {
+      for (const axis of [0, 1]) {
+        sortBinds[`${from}>${to}:${axis}`] = device.createBindGroup({
+          layout: sortPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: paramBuf } },
+            { binding: 1, resource: textures[from].createView() },
+            { binding: 2, resource: textures[to].createView() },
+            { binding: 3, resource: { buffer: axisBufs[axis] } },
+          ],
+        });
+      }
+    }
+    presentBinds = [nearest, linear].map(sampler => device.createBindGroup({
+      layout: presentPipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: paramBuf } },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: textures.out.createView() },
+        { binding: 3, resource: textures.source.createView() },
+      ],
+    }));
+    laidOut = layoutKey();
+  };
+  const layoutKey = () => `${innerWidth}x${innerHeight}@${Math.min(devicePixelRatio || 1, 2)}:${params.resolution}`;
+
+  const save = () => canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `pixel-sort-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+
+  /* ---- frame ---- */
+  let seed = 1;
+  const frame = () => {
+    if (layoutKey() !== laidOut) layout();
+
+    const feedSource = still ?? (cameraOk && video.readyState >= 2 && video.videoWidth > 0 ? video : null);
+    const fw = still ? still.displayWidth : video.videoWidth;
+    const fh = still ? still.displayHeight : video.videoHeight;
+
+    if (params.jitter) seed = (seed + 1) % 16777216;
+    paramData.set([
+      sw, sh,
+      params.lo, params.hi,
+      params.invert ? 1 : 0,
+      METRICS.indexOf(params.key),
+      params.reverse ? 1 : 0,
+      params.maxSpan,
+      params.breakChance,
+      seed,
+      params.showMask ? 1 : 0,
+      METRICS.indexOf(params.metric),
+    ]);
+    device.queue.writeBuffer(paramBuf, 0, paramData);
+
+    const enc = device.createCommandEncoder();
+
+    // freezing keeps the last frame in the source texture, so the sort stays live on it
+    if (feedSource && !params.frozen) {
+      const a = sw / sh, v = fw / fh;
+      // stills aren't mirrored: they're not a selfie
+      blitData.set([sw, sh, a > v ? 1 : a / v, a > v ? v / a : 1, params.mirror && !still ? 1 : 0]);
+      device.queue.writeBuffer(blitBuf, 0, blitData);
+      const feed = device.importExternalTexture({ source: feedSource });
+      const bp = enc.beginRenderPass({
+        colorAttachments: [{
+          view: textures.source.createView(),
+          clearValue: [0, 0, 0, 1],
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      bp.setPipeline(blitPipe);
+      // external textures expire every frame, so their bind groups do too
+      bp.setBindGroup(0, device.createBindGroup({
+        layout: blitPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: blitBuf } },
+          { binding: 1, resource: linear },
+          { binding: 2, resource: feed },
+        ],
+      }));
+      bp.draw(3);
+      bp.end();
+    }
+
+    const axes = DIRECTIONS[params.direction] ?? DIRECTIONS['columns → rows'];
+    const cp = enc.beginComputePass();
+    cp.setPipeline(sortPipe);
+    axes.forEach((axis, k) => {
+      const from = k === 0 ? 'source' : 'tmp';
+      const to = k === axes.length - 1 ? 'out' : 'tmp';
+      cp.setBindGroup(0, sortBinds[`${from}>${to}:${axis}`]);
+      // one workgroup per line: rows are as many as the height, columns the width
+      cp.dispatchWorkgroups(axis === 0 ? sh : sw);
+    });
+    cp.end();
+
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{
+        view: ctx.getCurrentTexture().createView(),
+        clearValue: [0, 0, 0, 1],
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    rp.setPipeline(presentPipe);
+    rp.setBindGroup(0, presentBinds[params.smooth ? 1 : 0]);
+    rp.draw(3);
+    rp.end();
+
+    device.queue.submit([enc.finish()]);
+    // the canvas can only be read in the task that drew it
+    if (actions.save) { actions.save = false; save(); }
+    requestAnimationFrame(frame);
+  };
+
+  layout();
+  requestAnimationFrame(frame);
+  await startCamera();
+}
+
+/* ---- controls: a leva panel, loaded separately so the sketch runs without it ---- */
+async function mountControls() {
+  const [React, { createRoot }, { Leva, useControls, folder, button, buttonGroup }] = await Promise.all([
+    import('react'), import('react-dom/client'), import('leva'),
+  ]);
+  const h = React.createElement;
+
+  function Controls() {
+    const [hidden, setHidden] = React.useState(false);
+    const setRef = React.useRef(null);
+    const applyPreset = name => setRef.current?.(PRESETS[name]);
+
+    const [values, set] = useControls(() => ({
+      'asdf mode': buttonGroup({
+        black: () => applyPreset('black'),
+        brightness: () => applyPreset('brightness'),
+        white: () => applyPreset('white'),
+      }),
+      looks: buttonGroup({
+        melt: () => applyPreset('melt'),
+        shards: () => applyPreset('shards'),
+        'random (r)': () => setRef.current?.(randomLook()),
+      }),
+      sort: folder({
+        direction: { value: params.direction, options: Object.keys(DIRECTIONS) },
+        key: { value: params.key, options: METRICS, label: 'sort by' },
+        reverse: params.reverse,
+      }),
+      threshold: folder({
+        metric: { value: params.metric, options: METRICS, label: 'measure' },
+        lo: { value: params.lo, min: 0, max: 1, step: 0.005, label: 'lower' },
+        hi: { value: params.hi, min: 0, max: 1, step: 0.005, label: 'upper' },
+        invert: params.invert,
+        showMask: { value: params.showMask, label: 'show mask (m)' },
+      }),
+      spans: folder({
+        maxSpan: { value: params.maxSpan, min: 0, max: 600, step: 1, label: 'max length' },
+        breakChance: { value: params.breakChance, min: 0, max: 0.03, step: 0.0005, label: 'random breaks' },
+        jitter: { value: params.jitter, label: 'reseed / frame' },
+      }),
+      view: folder({
+        resolution: { value: params.resolution, min: 0.1, max: 1, step: 0.05 },
+        smooth: params.smooth,
+        mirror: params.mirror,
+        frozen: { value: params.frozen, label: 'freeze (space)' },
+        'save png (s)': button(() => { actions.save = true; }),
+        'back to camera': button(() => actions.useCamera?.()),
+      }),
+    }));
+    setRef.current = set;
+
+    // the frame loop reads params every frame, so this is all the wiring it needs
+    Object.assign(params, values);
+
+    // keyboard shortcuts go through leva so the panel stays in sync
+    React.useEffect(() => {
+      const presetKeys = ['black', 'brightness', 'white', 'melt', 'shards'];
+      const onKey = e => {
+        if (e.target.closest?.('input, textarea')) return;
+        if (e.key === ' ') { e.preventDefault(); set({ frozen: !params.frozen }); }
+        else if (e.key === 'm') set({ showMask: !params.showMask });
+        else if (e.key === 'r') set(randomLook());
+        else if (e.key === 's') actions.save = true;
+        else if (e.key === 'h') setHidden(v => !v);
+        else if (e.key >= '1' && e.key <= String(presetKeys.length)) set(PRESETS[presetKeys[e.key - 1]]);
+      };
+      addEventListener('keydown', onKey);
+      return () => removeEventListener('keydown', onKey);
+    }, [set]);
+
+    return h(Leva, { hidden, titleBar: { title: 'pixel sort · h to hide' } });
+  }
+
+  createRoot(document.getElementById('controls')).render(h(Controls));
+}
+
+main().catch(err => { console.error(err); fail(err.message); });
+mountControls().catch(err => console.warn('controls unavailable', err));
+</script>
+</body>
+</html>
