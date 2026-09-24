@@ -723,6 +723,7 @@ function mutate(saveHistory = true) {
   });
 }
 function mountInteraction() {
+  $('randomise-button').onclick = () => mutate();
   $('camera-button').onclick = () => actions.useCamera?.();
   $('file-input').onchange = e => { actions.openImage?.(e.target.files[0]); e.target.value = ''; };
   let gesture = null;

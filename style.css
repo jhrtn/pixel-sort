@@ -11,3 +11,7 @@ button:disabled { opacity: .5; cursor: wait; }
 #hint, #toast { position: fixed; left: 0; right: 0; bottom: 22px; text-align: center; font-size: 10px; text-shadow: 0 1px 6px #000; pointer-events: none; }
 #toast { bottom: 45px; }
 #status { position: fixed; inset: 0; display: grid; place-content: center; padding: 30px; text-align: center; background: #111; }
+
+#randomise-button { position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); padding: 7px 12px; font-size: 10px; }
+#hint { bottom: calc(62px + env(safe-area-inset-bottom, 0px)); }
+#toast { bottom: calc(82px + env(safe-area-inset-bottom, 0px)); }

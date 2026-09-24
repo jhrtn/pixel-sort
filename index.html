@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="theme-color" content="#111" />
 <title>Pixel Sort</title>
-<link rel="stylesheet" href="style.css?v=4" />
+<link rel="stylesheet" href="style.css?v=5" />
 </head>
 <body>
 <canvas id="stage" tabindex="0" aria-label="Drag to sort pixels. Tap or press Space to hold or release the camera. R changes the effect. S saves an image."></canvas>
 <div id="start"><button id="camera-button" disabled>start camera</button><span>or drop an image</span></div>
 <input id="file-input" type="file" accept="image/*" hidden />
 <div id="hint" hidden>drag to pull · tap to hold</div>
+<button id="randomise-button" type="button" title="Randomise effect (R)">randomise</button>
 <div id="status" role="status">loading</div>
 <div id="toast" role="status" hidden></div>
 <script>
@@ -20,6 +21,6 @@
   addEventListener('error', e => report(`error: ${e.message || `could not load ${e.target?.src ?? 'a script'}`}`), true);
   addEventListener('unhandledrejection', e => report(`error: ${e.reason?.message ?? e.reason}`));
 </script>
-<script type="module" src="app.js?v=4"></script>
+<script type="module" src="app.js?v=5"></script>
 </body>
 </html>
