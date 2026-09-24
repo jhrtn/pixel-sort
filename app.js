@@ -1,7 +1,11 @@
+import { CameraCycle } from './camera-cycle.mjs';
 
 const canvas = document.getElementById('stage');
 const statusEl = document.getElementById('status');
-const fail = msg => { statusEl.hidden = false; statusEl.textContent = msg; };
+const fail = msg => {
+  statusEl.hidden = false; statusEl.textContent = msg;
+  document.getElementById('start').hidden = true;
+};
 
 /* ---- a port of Kim Asendorf's ASDFPixelSort to WebGPU, fed by the camera.
    ASDF walks every column, then every row: it finds the first pixel that
@@ -66,14 +70,14 @@ const randomLook = () => {
   };
 };
 
-/* ---- live parameters; the leva panel writes into this ---- */
+/* ---- live parameters shared by the controls and render loop ---- */
 const params = {
-  ...PRESETS.melt, resolution: 0.5, smooth: true, mirror: true, showMask: false, frozen: false,
-  amount: 0.85, split: -1, aberration: 0, grain: 0.035,
+  ...PRESETS.melt, resolution: 0.4, smooth: true, mirror: true, showMask: false, frozen: false,
+  amount: 0.85, split: -1, grain: 0.035,
 };
 const actions = { save: false, useCamera: null };
 
-/* ---- shared uniform block (48 bytes) ---- */
+/* ---- shared uniform block (64 bytes) ---- */
 const PARAMS = /* wgsl */ `
   struct P {
     size: vec2f,       // work texture px
@@ -89,7 +93,7 @@ const PARAMS = /* wgsl */ `
     metric: f32,       // index into METRICS, for the threshold
     amount: f32,
     split: f32,
-    aberration: f32,
+    padding: f32,
     grain: f32,
   };
 
@@ -276,9 +280,7 @@ const PRESENT = /* wgsl */ `
 
   @fragment
   fn fs(in: VOut) -> @location(0) vec4f {
-    let offset = vec2f(p.aberration * 0.015, 0.0);
-    let c = vec3f(textureSample(sorted, samp, in.uv + offset).r,
-      textureSample(sorted, samp, in.uv).g, textureSample(sorted, samp, in.uv - offset).b);
+    let c = textureSample(sorted, samp, in.uv).rgb;
     let s = textureSample(source, samp, in.uv).rgb;
     if (p.split >= 0.0 && in.uv.x < p.split) { return vec4f(s, 1.0); }
     if (p.showMask < 0.5) {
@@ -317,8 +319,10 @@ async function main() {
     still?.close(); still = frame;
     params.frozen = false;
     statusEl.hidden = true;
-    setSourceName(name);
-    syncUI();
+    $('camera-button').disabled = false;
+    $('camera-button').textContent = 'start camera';
+    document.body.dataset.source = name;
+    document.body.dataset.phase = 'still';
   };
   actions.demo = name => {
     sourceRequest++;
@@ -333,12 +337,14 @@ async function main() {
       const frame = new VideoFrame(bitmap, { timestamp: 0 });
       bitmap.close();
       setStill(frame, file.name);
-      toast('Image loaded');
+      $('start').hidden = true;
+      hint();
     } catch { toast('Could not open that image. Try PNG, JPEG or WebP.'); }
   };
   actions.useCamera = async () => {
     const request = ++sourceRequest;
-    toast('Waiting for camera permission…');
+    $('camera-button').disabled = true;
+    $('camera-button').textContent = 'connecting…';
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -353,17 +359,47 @@ async function main() {
       still?.close(); still = null;
       params.frozen = false;
       statusEl.hidden = true;
-      setSourceName('Live camera'); syncUI(); toast('Camera connected');
+      cycle.reset(performance.now());
+      $('start').hidden = true;
+      hint();
+      document.body.dataset.source = 'camera';
+      for (const track of stream.getVideoTracks()) track.addEventListener('ended', () => {
+        if (video.srcObject !== stream) return;
+        stopCamera();
+        $('start').hidden = false;
+        $('camera-button').textContent = 'restart camera';
+      });
     } catch (err) {
       stream?.getTracks().forEach(t => t.stop());
-      toast(`Camera unavailable (${err.name}). You can still use images and studies.`);
+      if (request === sourceRequest) {
+        $('start').hidden = false;
+        $('camera-button').textContent = 'retry camera';
+        toast('Camera unavailable. Try again, or drop an image.');
+      }
+    } finally {
+      if (request === sourceRequest) $('camera-button').disabled = false;
     }
   };
-  actions.freeze = () => {
-    if (!cameraOk) { toast('Freeze is available with the live camera'); return; }
-    if (!params.frozen && video.readyState >= 2) frozenFrame = new VideoFrame(video);
-    else { frozenFrame?.close(); frozenFrame = null; }
-    params.frozen = !!frozenFrame; syncUI();
+  const cycle = new CameraCycle();
+  let envelope = 1, lastFrame = performance.now();
+  actions.grab = () => { if (cameraOk) cycle.grab(); };
+  actions.release = () => cycle.release(performance.now());
+  actions.freeze = () => { if (cameraOk) cycle.toggle(performance.now()); };
+  const updateCapture = now => {
+    const dt = Math.min(100, now - lastFrame); lastFrame = now;
+    if (!cameraOk || video.readyState < 2) { envelope = 1; return; }
+    const held = cycle.tick(now);
+    if (held && !frozenFrame) {
+      frozenFrame = new VideoFrame(video);
+      // Each automatic hold begins a different sort. A grab keeps your settings.
+      if (!cycle.dragging && !cycle.pinned) mutate(false);
+    } else if (!held && frozenFrame) {
+      frozenFrame.close(); frozenFrame = null;
+    }
+    params.frozen = held;
+    document.body.dataset.phase = held ? 'held' : 'live';
+    const target = held ? 1 : .12;
+    envelope += (target - envelope) * (1 - Math.exp(-dt / 650));
   };
   addEventListener('pagehide', () => { stopCamera(); still?.close(); });
 
@@ -466,13 +502,13 @@ async function main() {
 
   /* ---- frame ---- */
   let seed = 1;
-  let fpsStart = performance.now(), frameCount = 0;
   const frame = () => {
+    updateCapture(performance.now());
     if (layoutKey() !== laidOut) layout();
 
     const feedSource = still ?? frozenFrame ?? (cameraOk && video.readyState >= 2 && video.videoWidth > 0 ? video : null);
-    const fw = still ? still.displayWidth : video.videoWidth;
-    const fh = still ? still.displayHeight : video.videoHeight;
+    const fw = (still ?? frozenFrame)?.displayWidth ?? video.videoWidth;
+    const fh = (still ?? frozenFrame)?.displayHeight ?? video.videoHeight;
 
     if (params.jitter) seed = (seed + 1) % 16777216;
     paramData.set([
@@ -486,13 +522,13 @@ async function main() {
       seed,
       params.showMask ? 1 : 0,
       METRICS.indexOf(params.metric),
-      params.amount, params.split, params.aberration, params.grain,
+      params.amount * envelope, params.split, 0, params.grain,
     ]);
     device.queue.writeBuffer(paramBuf, 0, paramData);
 
     const enc = device.createCommandEncoder();
 
-    // freezing keeps the last frame in the source texture, so the sort stays live on it
+    // A captured VideoFrame keeps a frozen camera frame intact across resizes.
     if (feedSource) {
       const a = sw / sh, v = fw / fh;
       // stills aren't mirrored: they're not a selfie
@@ -549,122 +585,54 @@ async function main() {
     device.queue.submit([enc.finish()]);
     // the canvas can only be read in the task that drew it
     if (actions.save) { actions.save = false; save(); }
-    frameCount++;
-    const now = performance.now();
-    if (now - fpsStart > 750) {
-      document.getElementById('performance').textContent = `${Math.round(frameCount * 1000 / (now - fpsStart))} FPS · ${sw} × ${sh}`;
-      fpsStart = now; frameCount = 0;
-    }
     requestAnimationFrame(frame);
   };
 
   layout();
   requestAnimationFrame(frame);
-  actions.demo('dunes');
-  document.getElementById('engine').textContent = 'WEBGPU ONLINE';
+  actions.demo('signal');
+  mutate();
+  $('camera-button').disabled = false;
 }
 
 
-/* ---- studio: dependency-free controls, procedural studies and local looks ---- */
-const LOOKS = {
-  melt: { ...PRESETS.melt, amount: .85, aberration: 0, grain: .035 },
-  shards: { ...PRESETS.shards, amount: 1, aberration: .12, grain: .025 },
-  cascade: { ...DEFAULTS, direction: 'columns', key: 'hue', metric: 'luma', lo: .18, hi: .9, amount: 1, aberration: .08, grain: .02 },
-  silk: { ...DEFAULTS, direction: 'rows', key: 'luma', metric: 'luma', lo: .18, hi: .92, amount: .7, aberration: 0, grain: .04 },
-  static: { ...PRESETS.shards, maxSpan: 42, breakChance: .025, key: 'asdf', amount: 1, aberration: .4, grain: .12 },
-  spectral: { ...DEFAULTS, key: 'saturation', metric: 'hue', lo: .05, hi: .95, maxSpan: 320, amount: .95, aberration: .55, grain: .02 },
-  black: { ...PRESETS.black, amount: 1, aberration: 0, grain: 0 },
-  white: { ...PRESETS.white, amount: 1, aberration: 0, grain: 0 },
-};
-const $ = id => document.getElementById(id);
-let activeLook = 'melt', toastTimer;
-let history = [];
-let savedLooks = [];
-try { savedLooks = JSON.parse(localStorage.getItem('pixel-sort-looks') || '[]'); } catch {}
-if (!Array.isArray(savedLooks)) savedLooks = [];
-savedLooks = savedLooks.filter(x => x && typeof x.name === 'string' && x.params && typeof x.params === 'object').slice(0, 12);
-const toast = message => {
-  $('toast').textContent = message; $('toast').hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 3400);
-};
-const snapshot = () => ({ ...params, activeLook });
-const remember = () => {
-  const state = snapshot();
-  if (JSON.stringify(history.at(-1)) !== JSON.stringify(state)) history.push(state);
-  if (history.length > 60) history.shift();
-  $('undo-button').disabled = !history.length;
-};
-const applyLook = (values, name = 'custom') => {
-  remember(); Object.assign(params, values); activeLook = name; syncUI();
-};
-function setSourceName(name) {
-  $('source-name').textContent = name;
-  document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('active', name === `Study / ${b.dataset.demo}`));
-  $('camera-button').classList.toggle('active', name === 'Live camera');
-}
-const controlSpecs = [
-  ['direction', 'Direction', Object.keys(DIRECTIONS), 'main'],
-  ['key', 'Sort by', METRICS, 'main'],
-  ['lo', 'Threshold · lower', 0, 1, .005, 'main'],
-  ['hi', 'Threshold · upper', 0, 1, .005, 'main'],
-  ['amount', 'Effect mix', 0, 1, .01, 'main'],
-  ['metric', 'Threshold measure', METRICS, 'fine'],
-  ['maxSpan', 'Maximum span · 0 is unlimited', 0, 600, 1, 'fine'],
-  ['breakChance', 'Random breaks', 0, .03, .0005, 'fine'],
-  ['aberration', 'Colour separation', 0, 1, .01, 'fine'],
-  ['grain', 'Film grain', 0, .3, .005, 'fine'],
-  ['resolution', 'Processing scale', .1, 1, .05, 'fine'],
-];
-function syncUI() {
-  document.querySelectorAll('[data-param]').forEach(el => {
-    const key = el.dataset.param;
-    if (el.type === 'checkbox') el.checked = params[key];
-    else el.value = params[key];
-    const output = document.querySelector(`output[for="param-${key}"]`);
-    if (output) output.textContent = key === 'maxSpan' ? (params[key] || '∞') : key === 'breakChance' ? `${(params[key] * 100).toFixed(2)}%` : `${Math.round(params[key] * 100)}%`;
-  });
-  document.querySelectorAll('[data-look]').forEach(b => b.classList.toggle('active', b.dataset.look === activeLook));
-  $('look-name').textContent = activeLook.toUpperCase();
-  $('compare-button').setAttribute('aria-pressed', params.split >= 0);
-  $('mask-button').setAttribute('aria-pressed', params.showMask);
-  $('freeze-button').setAttribute('aria-pressed', params.frozen);
-  $('freeze-button').firstChild.textContent = params.frozen ? 'Resume ' : 'Freeze ';
-  $('compare-line').hidden = params.split < 0;
-  $('compare-line').style.left = `${params.split * 100}%`;
-  $('view-label').textContent = params.showMask ? 'SORTING MASK' : params.split >= 0 ? 'COMPARISON' : 'PROCESSED';
-  $('undo-button').disabled = !history.length;
-}
-function renderSaved() {
-  $('saved-looks').replaceChildren();
-  if (!savedLooks.length) {
-    const el = document.createElement('div'); el.className = 'saved-empty';
-    el.textContent = 'Found something good? Keep the recipe here.'; $('saved-looks').append(el);
-  }
-  savedLooks.forEach((look, index) => {
-    const row = document.createElement('div'); row.className = 'saved-row';
-    const button = document.createElement('button'); button.textContent = look.name;
-    button.onclick = () => {
-      const values = {};
-      for (const key of Object.keys(LOOKS.melt)) {
-        if (typeof look.params[key] === typeof LOOKS.melt[key]) values[key] = look.params[key];
-      }
-      applyLook(values, 'saved'); toast(`Loaded ${look.name}`);
-    };
-    const remove = document.createElement('button'); remove.textContent = '×'; remove.setAttribute('aria-label', `Delete ${look.name}`);
-    remove.onclick = () => { savedLooks.splice(index, 1); persistLooks(); renderSaved(); };
-    row.append(button, remove); $('saved-looks').append(row);
-  });
-}
-function persistLooks() {
-  try { localStorage.setItem('pixel-sort-looks', JSON.stringify(savedLooks)); return true; }
-  catch { toast('Browser storage is unavailable. Looks last for this session only.'); return false; }
-}
+
 function makeDemo(name) {
   const art = document.createElement('canvas'); art.width = 1600; art.height = 1200;
   const c = art.getContext('2d'); const w = art.width, h = art.height;
-  let seed = 173;
+  let seed = name === 'signal' ? 1 + Math.floor(Math.random() * 2147483645) : 173;
   const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
-  if (name === 'dunes') {
+  if (name === 'signal') {
+    const palette = pick([
+      ['#eaf5a2', '#e08bce', '#ed512f', '#665de7'],
+      ['#fe734e', '#ffc6d9', '#759dec', '#f1ee93'],
+      ['#cded8c', '#66cdc0', '#bb70f1', '#fca478'],
+    ]);
+    c.fillStyle = '#171325'; c.fillRect(0, 0, w, h);
+    const phase = rand() * 6;
+    // Broad, overlapping ribbons give the sorter colour, edges and empty space.
+    for (let layer = 0; layer < 22; layer++) {
+      const y = -230 + layer * 76;
+      const gradient = c.createLinearGradient(0, y, w, y + 320);
+      gradient.addColorStop(0, palette[layer % 4]);
+      gradient.addColorStop(.48, palette[(layer + 1) % 4]);
+      gradient.addColorStop(1, '#21192e');
+      c.fillStyle = gradient;
+      c.beginPath();
+      for (let x = -100; x <= w + 100; x += 8) {
+        const yy = y + Math.sin(x / 310 + phase + layer * .12) * 240 + Math.cos(x / 570 + layer * .19) * 140;
+        if (x === -100) c.moveTo(x, yy); else c.lineTo(x, yy);
+      }
+      for (let x = w + 100; x >= -100; x -= 8) {
+        const yy = y + 52 + Math.sin(x / 310 + phase + layer * .12 + .04) * 240 + Math.cos(x / 570 + layer * .19) * 140;
+        c.lineTo(x, yy);
+      }
+      c.closePath(); c.fill();
+    }
+    const glow = c.createRadialGradient(650, 480, 10, 650, 480, 880);
+    glow.addColorStop(0, '#ffffff00'); glow.addColorStop(1, '#10091eb0');
+    c.fillStyle = glow; c.fillRect(0, 0, w, h);
+  } else if (name === 'dunes') {
     const sky = c.createLinearGradient(0, 0, 0, h);
     sky.addColorStop(0, '#242537'); sky.addColorStop(.3, '#766073'); sky.addColorStop(.57, '#e2a384'); sky.addColorStop(1, '#e9ad72');
     c.fillStyle = sky; c.fillRect(0, 0, w, h);
@@ -718,84 +686,87 @@ function makeDemo(name) {
   }
   c.putImageData(pixels, 0, 0); return art;
 }
-function mountControls() {
-  for (const name of Object.keys(LOOKS)) {
-    const b = document.createElement('button'); b.dataset.look = name;
-    b.textContent = name[0].toUpperCase() + name.slice(1); b.onclick = () => applyLook(LOOKS[name], name); $('presets').append(b);
-  }
-  for (const [key, label, ...spec] of controlSpecs) {
-    const field = document.createElement('div'); field.className = 'field';
-    const head = document.createElement('div'); head.className = 'field-head';
-    const title = document.createElement('label'); title.htmlFor = `param-${key}`; title.textContent = label; head.append(title);
-    let input;
-    if (Array.isArray(spec[0])) {
-      input = document.createElement('select');
-      for (const value of spec[0]) { const option = document.createElement('option'); option.value = value; option.textContent = ({ luma: 'Luminance', hue: 'Hue', saturation: 'Saturation', asdf: 'ASDF / RGB', max: 'Brightness' })[value] || value; input.append(option); }
-    } else {
-      input = document.createElement('input'); input.type = 'range'; [input.min, input.max, input.step] = spec;
-      const output = document.createElement('output'); output.htmlFor = `param-${key}`; head.append(output);
-    }
-    input.id = `param-${key}`; input.dataset.param = key;
-    field.append(head, input); $(`${spec.at(-1)}-controls`).append(field);
-  }
-  document.querySelectorAll('[data-param]').forEach(input => {
-    input.addEventListener('pointerdown', remember);
-    input.addEventListener('keydown', e => { if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown',' '].includes(e.key)) remember(); });
-    input.addEventListener('input', () => {
-      const key = input.dataset.param;
-      params[key] = input.type === 'checkbox' ? input.checked : input.type === 'range' ? Number(input.value) : input.value;
-      if (key === 'lo' && params.lo > params.hi) params.hi = params.lo;
-      if (key === 'hi' && params.hi < params.lo) params.lo = params.hi;
-      activeLook = 'custom'; syncUI();
-    });
-  });
-  $('upload-button').onclick = () => $('file-input').click();
-  $('file-input').onchange = e => { actions.openImage?.(e.target.files[0]); e.target.value = ''; };
-  $('camera-button').onclick = () => actions.useCamera?.();
-  document.querySelectorAll('[data-demo]').forEach(b => b.onclick = () => actions.demo?.(b.dataset.demo));
-  $('export-button').onclick = () => { actions.save = true; };
-  $('random-button').onclick = () => applyLook({ ...randomLook(), amount: .75 + Math.random() * .25, aberration: Math.random() * .35 }, 'accident');
-  $('random-fab').onclick = () => $('random-button').click();
-  $('reset-button').onclick = () => applyLook(LOOKS.melt, 'melt');
-  $('freeze-button').onclick = () => actions.freeze?.();
-  $('mask-button').onclick = () => { params.showMask = !params.showMask; syncUI(); };
-  $('compare-button').onclick = () => { params.split = params.split < 0 ? .5 : -1; syncUI(); };
-  $('hide-button').onclick = () => { const hidden = document.body.classList.toggle('zen'); $('hide-button').setAttribute('aria-label', hidden ? 'Show controls' : 'Hide controls'); if (hidden) toast('Press H or ↗ to bring the controls back'); };
-  $('undo-button').onclick = () => {
-    const previous = history.pop(); if (!previous) return;
-    const { activeLook: name, frozen, split, showMask, ...values } = previous;
-    Object.assign(params, values); activeLook = name; syncUI();
-  };
-  $('save-look').onclick = () => {
-    if (savedLooks.length >= 12) return toast('Your shelf is full. Remove a look to make room.');
-    const values = Object.fromEntries(Object.keys(LOOKS.melt).map(key => [key, params[key]]));
-    const number = Math.max(0, ...savedLooks.map(x => Number(x.name.match(/\d+$/)?.[0]) || 0)) + 1;
-    savedLooks.push({ name: `${activeLook[0].toUpperCase() + activeLook.slice(1)} / ${String(number).padStart(2, '0')}`, params: values });
-    if (persistLooks()) toast('Look saved on this device'); renderSaved();
-  };
-  $('help-button').onclick = () => $('help').showModal();
-  $('close-help').onclick = () => $('help').close();
-  $('help').onclick = e => { if (e.target === $('help')) { const r = $('help').getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) $('help').close(); } };
-  const handle = $('compare-handle');
-  const moveDivider = e => { const rect = canvas.getBoundingClientRect(); params.split = Math.max(.02, Math.min(.98, (e.clientX - rect.left) / rect.width)); syncUI(); };
-  handle.onpointerdown = e => { handle.setPointerCapture(e.pointerId); moveDivider(e); };
-  handle.onpointermove = e => { if (handle.hasPointerCapture(e.pointerId)) moveDivider(e); };
-  handle.onkeydown = e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); params.split = Math.max(.02, Math.min(.98, params.split + (e.key === 'ArrowLeft' ? -.02 : .02))); syncUI(); } };
-  addEventListener('keydown', e => {
-    if ($('help').open || e.target.closest?.('input, textarea, select, button') || e.altKey) return;
-    const key = e.key.toLowerCase();
-    if ((e.metaKey || e.ctrlKey) && key === 'z') { e.preventDefault(); $('undo-button').click(); return; }
-    if (e.metaKey || e.ctrlKey) return;
-    const shortcuts = { r: 'random-button', s: 'export-button', h: 'hide-button', m: 'mask-button', c: 'compare-button', ' ': 'freeze-button', '?': 'help-button' };
-    if (shortcuts[key]) { e.preventDefault(); $(shortcuts[key]).click(); }
-    else if (/^[1-8]$/.test(key)) { const name = Object.keys(LOOKS)[Number(key) - 1]; applyLook(LOOKS[name], name); }
-  });
-  let dragDepth = 0;
-  addEventListener('dragenter', e => { if (!e.dataTransfer.types.includes('Files')) return; e.preventDefault(); dragDepth++; $('drop-overlay').hidden = false; });
-  addEventListener('dragover', e => e.preventDefault());
-  addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('drop-overlay').hidden = true; } });
-  addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; $('drop-overlay').hidden = true; const file = [...e.dataTransfer.files].find(f => f.type.startsWith('image/')); if (file) actions.openImage?.(file); else toast('Drop an image file to get started'); });
-  renderSaved(); syncUI();
+
+const $ = id => document.getElementById(id);
+let toastTimer, hintTimer;
+const history = [];
+function toast(text) {
+  $('toast').textContent = text; $('toast').hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').hidden = true, 2800);
 }
-mountControls();
-main().catch(err => { console.error(err); fail(`The GPU could not start: ${err.message}`); $('engine').textContent = 'ENGINE UNAVAILABLE'; });
+function hint() {
+  $('hint').hidden = false;
+  clearTimeout(hintTimer); hintTimer = setTimeout(() => $('hint').hidden = true, 4500);
+}
+function remember() {
+  history.push({ ...params });
+  if (history.length > 60) history.shift();
+}
+function mutate(saveHistory = true) {
+  if (saveHistory) remember();
+  const base = pick([PRESETS.melt, PRESETS.shards, { ...DEFAULTS, direction: 'rows', key: 'luma' }]);
+  Object.assign(params, base, {
+    lo: .08 + Math.random() * .3, hi: .72 + Math.random() * .28,
+    reverse: chance(.5), maxSpan: chance(.5) ? 0 : 100 + Math.floor(Math.random() * 450),
+    amount: .9, grain: .01,
+  });
+}
+function mountInteraction() {
+  $('camera-button').onclick = () => actions.useCamera?.();
+  $('file-input').onchange = e => { actions.openImage?.(e.target.files[0]); e.target.value = ''; };
+  let gesture = null;
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || gesture) return;
+    remember();
+    canvas.focus({ preventScroll: true }); canvas.setPointerCapture(e.pointerId);
+    gesture = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false, start: { ...params } };
+    $('hint').hidden = true;
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (!gesture || gesture.id !== e.pointerId) return;
+    const dx = (e.clientX - gesture.x) / canvas.clientWidth;
+    const dy = (e.clientY - gesture.y) / canvas.clientHeight;
+    if (Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y) < 6 && !gesture.moved) return;
+    if (!gesture.moved) actions.grab?.();
+    gesture.moved = true;
+    const start = gesture.start;
+    params.lo = Math.max(0, Math.min(.88, start.lo + dx * .85));
+    params.hi = Math.min(1, Math.max(params.lo + .1, start.hi + dy * .6));
+    params.amount = Math.min(1, Math.max(.2, start.amount - dy * .8));
+    params.maxSpan = Math.abs(dy) < .06 ? 0 : Math.round(30 + (1 - Math.min(1, Math.abs(dy) * 2)) * 570);
+    if (Math.abs(dx) > .12 || Math.abs(dy) > .12) params.direction = Math.abs(dx) > Math.abs(dy) ? 'rows' : 'columns';
+  });
+  const release = (e, cancelled = false) => {
+    if (!gesture || gesture.id !== e.pointerId) return;
+    const moved = gesture.moved; gesture = null;
+    if (moved) actions.release?.();
+    else if (!cancelled) {
+      if (document.body.dataset.source === 'camera') actions.freeze?.();
+      else mutate(false);
+    }
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener('pointerup', e => release(e));
+  canvas.addEventListener('pointercancel', e => release(e, true));
+  canvas.addEventListener('lostpointercapture', e => release(e, true));
+  addEventListener('blur', () => { if (gesture?.moved) actions.release?.(); gesture = null; });
+  addEventListener('keydown', e => {
+    if (e.repeat || e.target.closest?.('button, input') || e.altKey) return;
+    const key = e.key.toLowerCase();
+    if ((e.metaKey || e.ctrlKey) && key !== 'z') return;
+    if (key === ' ') { e.preventDefault(); if (document.body.dataset.source === 'camera') actions.freeze?.(); else mutate(); }
+    else if (key === 'r') mutate();
+    else if (key === 's') actions.save = true;
+    else if (key === 'c') actions.useCamera?.();
+    else if (key === 'o') $('file-input').click();
+    else if (key === 'z') { e.preventDefault(); const old = history.pop(); if (old) Object.assign(params, old); }
+  });
+  addEventListener('dragover', e => e.preventDefault());
+  addEventListener('drop', e => {
+    e.preventDefault();
+    const file = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
+    if (file) actions.openImage?.(file);
+  });
+}
+mountInteraction();
+main().catch(err => { console.error(err); fail(err.message); });

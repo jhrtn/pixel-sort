@@ -3,50 +3,17 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="theme-color" content="#151715" />
-<meta name="description" content="A real-time pixel sorting instrument. Turn images and live camera feeds into beautifully broken studies." />
-<title>Pixel Sort — A study in disorder</title>
+<meta name="theme-color" content="#111" />
+<title>Pixel Sort</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<header class="topbar">
-  <a class="brand" href="./" aria-label="Pixel Sort home"><span class="mark" aria-hidden="true">▥</span> PIXEL SORT <span class="version">/ 02</span></a>
-  <span class="tagline">A STUDY IN DISORDER</span>
-  <div class="header-actions"><button id="help-button" class="icon-button" aria-label="Keyboard shortcuts">?</button><button id="hide-button" class="icon-button" aria-label="Hide controls">↗</button><button id="export-button" class="primary">Export PNG <span>↗</span></button></div>
-</header>
-<main>
-  <section class="viewport" aria-label="Pixel sorting preview">
-    <canvas id="stage" aria-label="Processed image preview"></canvas>
-    <div class="preview-top"><span class="pill"><i></i><span id="source-name">Study / dunes</span></span><span class="pill subtle" id="view-label">PROCESSED</span></div>
-    <div id="status" role="status">Starting the engine…</div>
-    <div id="compare-line" hidden><span>ORIGINAL</span><span>SORTED</span><button aria-label="Drag comparison divider" id="compare-handle">↔</button></div>
-    <div class="preview-bottom"><span class="art-caption">ORDER IS<br>OVERRATED.</span><span class="canvas-note">DRAG AN IMAGE INTO THE FRAME<br>MAKE SOMETHING UNEXPECTED.</span></div>
-    <div id="drop-overlay" hidden>Drop it. Break it.<small>PNG · JPEG · WebP · AVIF</small></div>
-  </section>
-  <aside id="controls" aria-label="Image controls">
-    <div class="panel-heading"><span>THE INSTRUMENT</span><span>↙</span></div>
-    <section class="control-section"><div class="section-label"><span>01 / SOURCE</span></div>
-      <div class="source-actions"><button id="upload-button">↥ &nbsp; Open image</button><button id="camera-button">◉ &nbsp; Camera</button></div>
-      <input id="file-input" type="file" accept="image/*" hidden />
-      <div class="studies" aria-label="Demo studies"><button data-demo="dunes" class="study dunes active"><span>01</span>Dunes</button><button data-demo="prism" class="study prism"><span>02</span>Prism</button><button data-demo="tide" class="study tide"><span>03</span>Tide</button></div>
-    </section>
-    <section class="control-section"><div class="section-label"><span>02 / TREATMENT</span><button class="text-button" id="reset-button">Reset ↺</button></div>
-      <div id="presets" class="presets"></div>
-      <button id="random-button" class="random-button"><span>⤨ &nbsp; Find an accident</span><kbd>R</kbd></button>
-    </section>
-    <section class="control-section"><div class="section-label"><span>03 / SHAPE THE SORT</span><span id="look-name">MELT</span></div>
-      <div id="main-controls"></div>
-      <div class="toggle-row"><label><input type="checkbox" data-param="reverse" /> Reverse</label><label><input type="checkbox" data-param="invert" /> Invert mask</label></div>
-      <details><summary>Fine controls <span>+</span></summary><div id="fine-controls"></div><div class="toggle-row"><label><input type="checkbox" data-param="jitter" /> Animate breaks</label><label><input type="checkbox" data-param="smooth" /> Smooth</label></div><label class="standalone-toggle"><input type="checkbox" data-param="mirror" /> Mirror camera</label></details>
-    </section>
-    <section class="control-section library-section"><div class="section-label"><span>04 / YOUR LOOKS</span><button class="text-button" id="save-look">Save current +</button></div><div id="saved-looks"></div></section>
-    <div class="panel-footer">Pixels, rearranged. Nothing added.<br><span>Inspired by Kim Asendorf’s ASDFPixelSort.</span></div>
-  </aside>
-</main>
-<footer class="toolbar"><div class="engine-status"><i></i><span id="engine">STARTING WEBGPU</span><span id="performance">— FPS</span></div><div class="view-actions"><button id="freeze-button" aria-pressed="false">Freeze <kbd>SPACE</kbd></button><button id="mask-button" aria-pressed="false">Mask <kbd>M</kbd></button><button id="compare-button" aria-pressed="false">Compare <kbd>C</kbd></button><button id="undo-button" aria-label="Undo adjustment" title="Undo (Ctrl/⌘ Z)">↶</button></div></footer>
-<button id="random-fab" class="random-fab" aria-label="Find a random look">⤨ &nbsp; Randomise</button>
+<canvas id="stage" tabindex="0" aria-label="Drag to sort pixels. Tap or press Space to hold or release the camera. R changes the effect. S saves an image."></canvas>
+<div id="start"><button id="camera-button" disabled>start camera</button><span>or drop an image</span></div>
+<input id="file-input" type="file" accept="image/*" hidden />
+<div id="hint" hidden>drag to pull · tap to hold</div>
+<div id="status" role="status">loading</div>
 <div id="toast" role="status" hidden></div>
-<dialog id="help"><div class="dialog-heading"><h2>A little controlled chaos.</h2><button id="close-help" aria-label="Close shortcuts">×</button></div><p>Open an image, choose a study, or connect your camera. The sorter rearranges pixels within a brightness or colour range. Move the threshold to find the interesting edges.</p><dl><dt>R</dt><dd>Find a random look</dd><dt>1–8</dt><dd>Switch treatment</dd><dt>C</dt><dd>Compare · drag the divider</dd><dt>M</dt><dd>Show the sorting mask</dd><dt>Space</dt><dd>Freeze the live camera</dd><dt>S</dt><dd>Export the current view</dd><dt>H</dt><dd>Hide the interface</dd><dt>⌘ / Ctrl Z</dt><dd>Undo an adjustment</dd></dl><p class="privacy-note">Images stay in your browser. Saved looks live on this device. Exports contain only the canvas, at the preview’s aspect ratio.</p></dialog>
 <script type="module" src="app.js"></script>
 </body>
 </html>
