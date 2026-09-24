@@ -1,4 +1,4 @@
-import { CameraCycle } from './camera-cycle.mjs';
+import { CameraCycle } from './camera-cycle.mjs?v=4';
 
 const canvas = document.getElementById('stage');
 const statusEl = document.getElementById('status');
@@ -294,10 +294,18 @@ const PRESENT = /* wgsl */ `
 
 async function main() {
   if (!navigator.gpu) return fail('WebGPU not available in this browser');
-  const adapter = await navigator.gpu.requestAdapter();
+  // some Android drivers never answer, so each request reports where it stalled
+  const within = (promise, label) => Promise.race([promise, new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`${label} timed out`)), 10000))]);
+  statusEl.textContent = 'loading · gpu adapter';
+  const adapter = await within(navigator.gpu.requestAdapter(), 'GPU adapter request');
   if (!adapter) return fail('No WebGPU adapter');
-  const device = await adapter.requestDevice();
-  device.lost.then(info => fail(`GPU lost: ${info.message}`));
+  const gpuName = [adapter.info?.vendor, adapter.info?.architecture, adapter.info?.device].filter(Boolean).join(' ') || 'unknown GPU';
+  statusEl.textContent = `loading · gpu device (${gpuName})`;
+  const device = await within(adapter.requestDevice(), `GPU device request (${gpuName})`);
+  device.lost.then(info => fail(`GPU lost: ${info.message} (${gpuName})`));
+  device.addEventListener('uncapturederror', e => fail(`GPU error: ${e.error.message} (${gpuName})`));
+  statusEl.textContent = `loading · shaders (${gpuName})`;
 
   const ctx = canvas.getContext('webgpu');
   const format = navigator.gpu.getPreferredCanvasFormat();
@@ -503,6 +511,10 @@ async function main() {
   /* ---- frame ---- */
   let seed = 1;
   const frame = () => {
+    try { draw(); } catch (err) { console.error(err); fail(`render error: ${err.message} (${gpuName})`); return; }
+    requestAnimationFrame(frame);
+  };
+  const draw = () => {
     updateCapture(performance.now());
     if (layoutKey() !== laidOut) layout();
 
@@ -585,7 +597,6 @@ async function main() {
     device.queue.submit([enc.finish()]);
     // the canvas can only be read in the task that drew it
     if (actions.save) { actions.save = false; save(); }
-    requestAnimationFrame(frame);
   };
 
   layout();

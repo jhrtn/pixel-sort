@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="theme-color" content="#111" />
 <title>Pixel Sort</title>
-<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="style.css?v=4" />
 </head>
 <body>
 <canvas id="stage" tabindex="0" aria-label="Drag to sort pixels. Tap or press Space to hold or release the camera. R changes the effect. S saves an image."></canvas>
@@ -14,6 +14,12 @@
 <div id="hint" hidden>drag to pull · tap to hold</div>
 <div id="status" role="status">loading</div>
 <div id="toast" role="status" hidden></div>
-<script type="module" src="app.js"></script>
+<script>
+  // before the module, so a script that fails to load or parse still reports
+  const report = msg => { const s = document.getElementById('status'); s.hidden = false; s.textContent = msg; };
+  addEventListener('error', e => report(`error: ${e.message || `could not load ${e.target?.src ?? 'a script'}`}`), true);
+  addEventListener('unhandledrejection', e => report(`error: ${e.reason?.message ?? e.reason}`));
+</script>
+<script type="module" src="app.js?v=4"></script>
 </body>
 </html>
